@@ -1,0 +1,26 @@
+﻿{
+    "name":  "source-maps",
+    "version":  "1.0.0",
+    "description":  "A small wrapper around Mozilla source-map for downloading JavaScript bundles, saving source maps, and reconstructing readable sources.",
+    "main":  "map",
+    "scripts":  {
+                    "test":  "echo \"Error: no test specified\" \u0026\u0026 exit 1"
+                },
+    "keywords":  [
+                     "source-map",
+                     "sourcemap",
+                     "javascript",
+                     "reconstruction",
+                     "security-research",
+                     "bug-bounty"
+                 ],
+    "author":  "Bugatsec",
+    "license":  "ISC",
+    "type":  "commonjs",
+    "dependencies":  {
+                         "source-map":  "^0.7.6"
+                     },
+    "bin":  {
+                "map":  "./map"
+            }
+}

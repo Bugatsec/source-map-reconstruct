@@ -1,0 +1,146 @@
+#!/usr/bin/env node
+const fs = require("fs");
+const path = require("path");
+const http = require("http");
+const https = require("https");
+const { URL } = require("url");
+const { SourceMapConsumer } = require("source-map");
+
+const TOOL_DIR = __dirname;
+
+function usage(exitCode = 0) {
+  console.log(`Usage:
+  map -js <url> -map <url>
+
+Example:
+  map -js https://example.com/static/app.js -map https://example.com/static/app.js.map
+
+Output:
+  source-map/<host>/app.js
+  source-map/<host>/app.js.map
+  source-map/<host>/reconstructed-app.js
+  source-map/<host>/urls.txt`);
+  process.exit(exitCode);
+}
+
+function argValue(flag) {
+  const index = process.argv.indexOf(flag);
+  if (index === -1) return null;
+  return process.argv[index + 1] || null;
+}
+
+function sanitizeHost(host) {
+  return host.replace(/[^a-zA-Z0-9._-]/g, "_");
+}
+
+function fileNameFromUrl(rawUrl, fallback) {
+  const parsed = new URL(rawUrl);
+  const base = path.posix.basename(parsed.pathname);
+  return base && base !== "/" ? decodeURIComponent(base) : fallback;
+}
+
+function download(rawUrl, outFile, redirectCount = 0) {
+  if (redirectCount > 8) {
+    return Promise.reject(new Error(`Too many redirects for ${rawUrl}`));
+  }
+
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(rawUrl);
+    const client = parsed.protocol === "https:" ? https : http;
+
+    const req = client.get(parsed, (res) => {
+      if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
+        const location = res.headers.location;
+        res.resume();
+        if (!location) return reject(new Error(`Redirect without Location for ${rawUrl}`));
+        return resolve(download(new URL(location, parsed).toString(), outFile, redirectCount + 1));
+      }
+
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        res.resume();
+        return reject(new Error(`HTTP ${res.statusCode} while downloading ${rawUrl}`));
+      }
+
+      const stream = fs.createWriteStream(outFile);
+      res.pipe(stream);
+      stream.on("finish", () => stream.close(resolve));
+      stream.on("error", reject);
+    });
+
+    req.setTimeout(30000, () => req.destroy(new Error(`Timeout downloading ${rawUrl}`)));
+    req.on("error", reject);
+  });
+}
+
+async function reconstruct(mapFile, outFile) {
+  const raw = fs.readFileSync(mapFile, "utf8");
+  const parsedMap = JSON.parse(raw);
+  const chunks = [];
+
+  await SourceMapConsumer.with(parsedMap, null, async (consumer) => {
+    for (const source of consumer.sources) {
+      const content = consumer.sourceContentFor(source, true);
+      if (content == null) continue;
+      chunks.push(`/* ==== source: ${source} ==== */\n${content}\n`);
+    }
+  });
+
+  if (chunks.length === 0) {
+    chunks.push("/* This source map does not contain sourcesContent, so original sources cannot be reconstructed from the map alone. */\n");
+    chunks.push(`/* Sources listed in map:\n${(parsedMap.sources || []).join("\n")}\n*/\n`);
+  }
+
+  fs.writeFileSync(outFile, chunks.join("\n"), "utf8");
+}
+
+function recordUrls(urlsFile, reconstructedName, jsUrl, mapUrl) {
+  const entry = [
+    `/* ==== filename: ${reconstructedName} ==== */`,
+    `js: ${jsUrl}`,
+    `map: ${mapUrl}`,
+    "",
+    "",
+  ].join("\n");
+
+  fs.appendFileSync(urlsFile, entry, "utf8");
+}
+
+async function main() {
+  if (process.argv.includes("-h") || process.argv.includes("--help")) usage(0);
+
+  const jsUrl = argValue("-js");
+  const mapUrl = argValue("-map");
+  if (!jsUrl || !mapUrl) usage(1);
+
+  const parsedJs = new URL(jsUrl);
+  const hostDir = path.join(TOOL_DIR, sanitizeHost(parsedJs.host));
+  fs.mkdirSync(hostDir, { recursive: true });
+
+  const jsName = fileNameFromUrl(jsUrl, "bundle.js");
+  const mapName = fileNameFromUrl(mapUrl, `${jsName}.map`);
+  const jsFile = path.join(hostDir, jsName);
+  const mapFile = path.join(hostDir, mapName);
+  const jsStem = path.basename(jsName, path.extname(jsName));
+  const reconstructedFile = path.join(hostDir, `reconstructed-${jsStem}.js`);
+  const urlsFile = path.join(hostDir, "urls.txt");
+
+  console.log(`[+] Saving files in: ${hostDir}`);
+  console.log(`[+] Downloading JS:  ${jsUrl}`);
+  await download(jsUrl, jsFile);
+  console.log(`[+] Downloading map: ${mapUrl}`);
+  await download(mapUrl, mapFile);
+  console.log(`[+] Reconstructing:  ${path.basename(reconstructedFile)}`);
+  await reconstruct(mapFile, reconstructedFile);
+  recordUrls(urlsFile, path.basename(reconstructedFile), jsUrl, mapUrl);
+
+  console.log("[+] Done");
+  console.log(`    ${jsFile}`);
+  console.log(`    ${mapFile}`);
+  console.log(`    ${reconstructedFile}`);
+  console.log(`    ${urlsFile}`);
+}
+
+main().catch((err) => {
+  console.error(`[-] ${err.message}`);
+  process.exit(1);
+});

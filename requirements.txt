@@ -1,0 +1,14 @@
+﻿# Runtime requirements for Source Maps
+
+Node.js >= 18
+npm >= 9
+zsh optional, only needed for the `alias map=...` workflow
+Internet access to download the target `.js` and `.map` URLs
+
+# npm dependency
+
+source-map@0.7.6
+
+Install with:
+
+npm install
