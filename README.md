@@ -27,10 +27,16 @@ You give it the JavaScript URL and the source map URL. It downloads both files, 
 - npm 9 or newer
 - zsh if you want the `map` alias
 
-Install dependencies:
+Install the project dependencies from `package.json`:
 
 ```sh
 npm install
+```
+
+This installs Mozilla's `source-map` npm package. If you are setting the wrapper up manually from a fresh folder, install it directly with:
+
+```sh
+npm install source-map
 ```
 
 ## Usage
