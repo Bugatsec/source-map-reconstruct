@@ -1,4 +1,4 @@
-﻿# Source Maps
+﻿# Source Maps Reconstructer
 
 ![Node.js](https://img.shields.io/badge/Node.js-18%2B-339933?logo=node.js&logoColor=white)
 ![Mozilla Source Map](https://img.shields.io/badge/Mozilla-source--map-FF7139?logo=mozilla&logoColor=white)
