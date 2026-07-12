@@ -10,7 +10,6 @@ Source Maps is a tiny wrapper script around Mozilla's `source-map` npm package. 
 
 You give it the JavaScript URL and the source map URL. It downloads both files, stores them under a folder named after the target host, reconstructs a cleaner readable file from `sourcesContent`, and saves the original URLs in `urls.txt` so you can remember exactly where each file came from later.
 
-Recommended repo name: `source-maps`. Other good options: `map-recall`, `sourcemap-reconstructor`, or `source-map-wrapper`.
 
 ## Features
 
@@ -21,7 +20,6 @@ Recommended repo name: `source-maps`. Other good options: `map-recall`, `sourcem
 - Reconstructs readable source content into `reconstructed-<name>.js`.
 - Appends every run to `urls.txt` with the reconstructed filename, JS URL, and map URL.
 - Keeps multiple reconstructions organized by host.
-- Works well in Kali WSL with a simple `map` alias.
 
 ## Requirements
 
@@ -87,10 +85,10 @@ map: https://example.com/static/vendor.js.map
 
 ## Alias Setup
 
-Add this to `~/.zshrc` if the tool lives in `~/mytool/source-map`:
+Add this to `~/.zshrc`:
 
 ```sh
-alias map="$HOME/mytool/source-map/map"
+alias map="$HOME/tool/source-map/map"
 ```
 
 Then reload zsh:
