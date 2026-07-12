@@ -6,7 +6,7 @@
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20WSL-lightgrey)
 ![Security Research](https://img.shields.io/badge/use-security%20research-red)
 
-Source Maps is a tiny wrapper script around Mozilla's `source-map` npm package. It is made for security researchers, bug bounty hunters, and JavaScript reviewers who want to analyze exposed source maps without repeating the same manual steps every time.
+**`source-map-reconstruct`** is a tiny wrapper script around Mozilla's `source-map` npm package. It is made for security researchers, bug bounty hunters, and JavaScript reviewers who want to analyze exposed source maps without repeating the same manual steps every time.
 
 You give it the JavaScript URL and the source map URL. It downloads both files, stores them under a folder named after the target host, reconstructs a cleaner readable file from `sourcesContent`, and saves the original URLs in `urls.txt` so you can remember exactly where each file came from later.
 
