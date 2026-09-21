@@ -6,31 +6,55 @@ const https = require("https");
 const { URL } = require("url");
 const { SourceMapConsumer } = require("source-map");
 
-const TOOL_DIR = __dirname;
-
 function usage(exitCode = 0) {
   console.log(`Usage:
-  map -js <url> -map <url>
+  map -js <url> -map <url|local-file> [options]
 
-Example:
-  map -js https://example.com/static/app.js -map https://example.com/static/app.js.map
+Required:
+  -js  <url>            URL of the bundled/minified JS file
+  -map <url|path>       URL of the .js.map file, OR a path to a local .map
+                         file already on disk (skips downloading it)
 
-Output:
-  source-map/<host>/app.js
-  source-map/<host>/app.js.map
-  source-map/<host>/reconstructed-app.js
-  source-map/<host>/urls.txt`);
+Options:
+  -o, --output <dir>    Base output directory (default: ./source-map)
+  --no-raw              Don't write the per-source-file raw/ tree
+  --no-combined         Don't write the single combined reconstructed-*.js
+  -h, --help            Show this help
+
+Output (under <output>/<host>/):
+  app.js                 the downloaded bundle (only if -js was a URL)
+  app.js.map              the downloaded/used sourcemap
+  reconstructed-app.js    all original sources concatenated into one file
+  raw/...                 each original source written to its own file,
+                          preserving its webpack:// folder structure
+  raw/MANIFEST.txt        maps original source path -> written raw/ file
+  urls.txt                log of js/map URLs used for this run`);
   process.exit(exitCode);
 }
 
-function argValue(flag) {
-  const index = process.argv.indexOf(flag);
-  if (index === -1) return null;
-  return process.argv[index + 1] || null;
+function argValue(...flags) {
+  for (const flag of flags) {
+    const index = process.argv.indexOf(flag);
+    if (index !== -1) return process.argv[index + 1] || null;
+  }
+  return null;
+}
+
+function hasFlag(...flags) {
+  return flags.some((f) => process.argv.includes(f));
 }
 
 function sanitizeHost(host) {
   return host.replace(/[^a-zA-Z0-9._-]/g, "_");
+}
+
+function isHttpUrl(value) {
+  try {
+    const u = new URL(value);
+    return u.protocol === "http:" || u.protocol === "https:";
+  } catch {
+    return false;
+  }
 }
 
 function fileNameFromUrl(rawUrl, fallback) {
@@ -72,25 +96,114 @@ function download(rawUrl, outFile, redirectCount = 0) {
   });
 }
 
-async function reconstruct(mapFile, outFile) {
+/**
+ * Turn a raw "sources" entry (e.g. "webpack://app/./src/auth.js",
+ * or something adversarial like "webpack://../../../../etc/passwd")
+ * into a list of safe path segments with no traversal, no leading
+ * slashes, and no protocol prefixes.
+ */
+function sanitizeSourcePath(rawSource, sourceRoot) {
+  let p = sourceRoot ? `${sourceRoot.replace(/\/+$/, "")}/${rawSource}` : rawSource;
+
+  // Strip common bundler protocol prefixes.
+  p = p.replace(/^webpack-internal:\/\/\//, "");
+  p = p.replace(/^webpack:\/\/\/?/, "");
+  p = p.replace(/^file:\/\/\//, "");
+
+  // Drop query/hash suffixes some bundlers append to source paths.
+  p = p.split("?")[0].split("#")[0];
+
+  try {
+    p = decodeURIComponent(p);
+  } catch {
+    // leave as-is if it isn't validly encoded
+  }
+
+  p = p.replace(/\\/g, "/");
+
+  // Split into segments and drop anything that could escape the output dir:
+  // "..", ".", empty segments (from "//"), and absolute-path leading slash.
+  const segments = p
+    .split("/")
+    .filter((seg) => seg !== "" && seg !== "." && seg !== "..")
+    .map((seg) => seg.replace(/[\x00-\x1f]/g, "_")); // strip control chars
+
+  if (segments.length === 0) segments.push("unknown-source.js");
+  return segments;
+}
+
+/**
+ * Join sanitized segments under root and verify the result cannot
+ * escape root, even after sanitizeSourcePath's own filtering. Belt
+ * and suspenders against path traversal from untrusted map content.
+ */
+function safeJoin(root, segments) {
+  const resolvedRoot = path.resolve(root);
+  const candidate = path.resolve(resolvedRoot, ...segments);
+  if (candidate !== resolvedRoot && !candidate.startsWith(resolvedRoot + path.sep)) {
+    // Should be unreachable given sanitizeSourcePath, but fall back to a
+    // flattened filename rather than ever writing outside root.
+    const flatName = segments.join("_").replace(/[^a-zA-Z0-9._-]/g, "_") || "unknown-source.js";
+    return path.join(resolvedRoot, flatName);
+  }
+  return candidate;
+}
+
+async function reconstruct(mapFile, { combinedFile, rawDir, writeCombined, writeRaw }) {
   const raw = fs.readFileSync(mapFile, "utf8");
   const parsedMap = JSON.parse(raw);
+  const sourceRoot = parsedMap.sourceRoot || "";
+
   const chunks = [];
+  const manifestLines = [];
+  const usedPaths = new Map(); // dedupe collisions between distinct sources
+  let writtenCount = 0;
 
   await SourceMapConsumer.with(parsedMap, null, async (consumer) => {
     for (const source of consumer.sources) {
       const content = consumer.sourceContentFor(source, true);
       if (content == null) continue;
-      chunks.push(`/* ==== source: ${source} ==== */\n${content}\n`);
+
+      if (writeCombined) {
+        chunks.push(`/* ==== source: ${source} ==== */\n${content}\n`);
+      }
+
+      if (writeRaw) {
+        const segments = sanitizeSourcePath(source, sourceRoot);
+        let outPath = safeJoin(rawDir, segments);
+
+        // Handle two different original sources normalizing to the same path.
+        if (usedPaths.has(outPath)) {
+          const n = usedPaths.get(outPath) + 1;
+          usedPaths.set(outPath, n);
+          const ext = path.extname(outPath);
+          outPath = outPath.slice(0, -ext.length || undefined) + `__dup${n}` + ext;
+        } else {
+          usedPaths.set(outPath, 0);
+        }
+
+        fs.mkdirSync(path.dirname(outPath), { recursive: true });
+        fs.writeFileSync(outPath, content, "utf8");
+        manifestLines.push(`${source}\t->\t${path.relative(rawDir, outPath)}`);
+        writtenCount++;
+      }
     }
   });
 
-  if (chunks.length === 0) {
-    chunks.push("/* This source map does not contain sourcesContent, so original sources cannot be reconstructed from the map alone. */\n");
-    chunks.push(`/* Sources listed in map:\n${(parsedMap.sources || []).join("\n")}\n*/\n`);
+  if (writeCombined) {
+    if (chunks.length === 0) {
+      chunks.push("/* This source map does not contain sourcesContent, so original sources cannot be reconstructed from the map alone. */\n");
+      chunks.push(`/* Sources listed in map:\n${(parsedMap.sources || []).join("\n")}\n*/\n`);
+    }
+    fs.writeFileSync(combinedFile, chunks.join("\n"), "utf8");
   }
 
-  fs.writeFileSync(outFile, chunks.join("\n"), "utf8");
+  if (writeRaw) {
+    fs.mkdirSync(rawDir, { recursive: true });
+    fs.writeFileSync(path.join(rawDir, "MANIFEST.txt"), manifestLines.join("\n") + "\n", "utf8");
+  }
+
+  return writtenCount;
 }
 
 function recordUrls(urlsFile, reconstructedName, jsUrl, mapUrl) {
@@ -106,37 +219,64 @@ function recordUrls(urlsFile, reconstructedName, jsUrl, mapUrl) {
 }
 
 async function main() {
-  if (process.argv.includes("-h") || process.argv.includes("--help")) usage(0);
+  if (hasFlag("-h", "--help")) usage(0);
 
   const jsUrl = argValue("-js");
-  const mapUrl = argValue("-map");
-  if (!jsUrl || !mapUrl) usage(1);
+  const mapArg = argValue("-map");
+  if (!jsUrl || !mapArg) usage(1);
+  if (!isHttpUrl(jsUrl)) {
+    console.error("[-] -js must be an http(s) URL");
+    process.exit(1);
+  }
+
+  const outputBase = argValue("-o", "--output") || path.join(process.cwd(), "source-map");
+  const writeRaw = !hasFlag("--no-raw");
+  const writeCombined = !hasFlag("--no-combined");
 
   const parsedJs = new URL(jsUrl);
-  const hostDir = path.join(TOOL_DIR, sanitizeHost(parsedJs.host));
+  const hostDir = path.join(path.resolve(outputBase), sanitizeHost(parsedJs.host));
   fs.mkdirSync(hostDir, { recursive: true });
 
+  const mapIsUrl = isHttpUrl(mapArg);
   const jsName = fileNameFromUrl(jsUrl, "bundle.js");
-  const mapName = fileNameFromUrl(mapUrl, `${jsName}.map`);
+  const mapName = mapIsUrl ? fileNameFromUrl(mapArg, `${jsName}.map`) : path.basename(mapArg);
   const jsFile = path.join(hostDir, jsName);
-  const mapFile = path.join(hostDir, mapName);
+  const mapFile = mapIsUrl ? path.join(hostDir, mapName) : path.resolve(mapArg);
   const jsStem = path.basename(jsName, path.extname(jsName));
   const reconstructedFile = path.join(hostDir, `reconstructed-${jsStem}.js`);
+  const rawDir = path.join(hostDir, "raw");
   const urlsFile = path.join(hostDir, "urls.txt");
 
   console.log(`[+] Saving files in: ${hostDir}`);
   console.log(`[+] Downloading JS:  ${jsUrl}`);
   await download(jsUrl, jsFile);
-  console.log(`[+] Downloading map: ${mapUrl}`);
-  await download(mapUrl, mapFile);
-  console.log(`[+] Reconstructing:  ${path.basename(reconstructedFile)}`);
-  await reconstruct(mapFile, reconstructedFile);
-  recordUrls(urlsFile, path.basename(reconstructedFile), jsUrl, mapUrl);
+
+  if (mapIsUrl) {
+    console.log(`[+] Downloading map: ${mapArg}`);
+    await download(mapArg, mapFile);
+  } else {
+    console.log(`[+] Using local map: ${mapFile}`);
+    if (!fs.existsSync(mapFile)) {
+      console.error(`[-] Local map file not found: ${mapFile}`);
+      process.exit(1);
+    }
+  }
+
+  console.log(`[+] Reconstructing sources...`);
+  const writtenCount = await reconstruct(mapFile, {
+    combinedFile: reconstructedFile,
+    rawDir,
+    writeCombined,
+    writeRaw,
+  });
+
+  recordUrls(urlsFile, path.basename(reconstructedFile), jsUrl, mapIsUrl ? mapArg : mapFile);
 
   console.log("[+] Done");
+  if (mapIsUrl) console.log(`    ${mapFile}`);
   console.log(`    ${jsFile}`);
-  console.log(`    ${mapFile}`);
-  console.log(`    ${reconstructedFile}`);
+  if (writeCombined) console.log(`    ${reconstructedFile}`);
+  if (writeRaw) console.log(`    ${rawDir}/ (${writtenCount} files) + MANIFEST.txt`);
   console.log(`    ${urlsFile}`);
 }
 
