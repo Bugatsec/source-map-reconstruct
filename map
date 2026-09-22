@@ -3,27 +3,39 @@ const fs = require("fs");
 const path = require("path");
 const http = require("http");
 const https = require("https");
+const crypto = require("crypto");
 const { URL } = require("url");
 const { SourceMapConsumer } = require("source-map");
 
+let INSECURE_TLS = false;
+
 function usage(exitCode = 0) {
   console.log(`Usage:
-  map -js <url> -map <url|local-file> [options]
+  map -js <url> [-map <url|local-file>] [options]
 
 Required:
   -js  <url>            URL of the bundled/minified JS file
-  -map <url|path>       URL of the .js.map file, OR a path to a local .map
-                         file already on disk (skips downloading it)
 
-Options:
+Optional:
+  -map <url|path>       URL of the .js.map file, OR a path to a local .map
+                         file already on disk (skips downloading it).
+                         If omitted, the tool tries to auto-discover the
+                         map from a "//# sourceMappingURL=" comment in the
+                         downloaded JS, or a SourceMap/X-SourceMap response
+                         header, including inline base64 data: maps.
+
   -o, --output <dir>    Base output directory (default: ./source-map)
+  --insecure            Do not verify TLS certificates (self-signed/lab hosts)
+  --jsonl <file>         Append structured JSON-lines records for this run
+                         to <file> (one "run" record + one "source" record
+                         per entry in the sourcemap's sources[])
   --no-raw              Don't write the per-source-file raw/ tree
   --no-combined         Don't write the single combined reconstructed-*.js
   -h, --help            Show this help
 
 Output (under <output>/<host>/):
-  app.js                 the downloaded bundle (only if -js was a URL)
-  app.js.map              the downloaded/used sourcemap
+  app.js                 the downloaded bundle
+  app.js.map              the downloaded/used/discovered sourcemap
   reconstructed-app.js    all original sources concatenated into one file
   raw/...                 each original source written to its own file,
                           preserving its webpack:// folder structure
@@ -63,6 +75,7 @@ function fileNameFromUrl(rawUrl, fallback) {
   return base && base !== "/" ? decodeURIComponent(base) : fallback;
 }
 
+// Resolves with the response headers (lowercase keys) once the file is written.
 function download(rawUrl, outFile, redirectCount = 0) {
   if (redirectCount > 8) {
     return Promise.reject(new Error(`Too many redirects for ${rawUrl}`));
@@ -71,8 +84,9 @@ function download(rawUrl, outFile, redirectCount = 0) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(rawUrl);
     const client = parsed.protocol === "https:" ? https : http;
+    const reqOptions = parsed.protocol === "https:" ? { rejectUnauthorized: !INSECURE_TLS } : {};
 
-    const req = client.get(parsed, (res) => {
+    const req = client.get(parsed, reqOptions, (res) => {
       if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
         const location = res.headers.location;
         res.resume();
@@ -87,13 +101,55 @@ function download(rawUrl, outFile, redirectCount = 0) {
 
       const stream = fs.createWriteStream(outFile);
       res.pipe(stream);
-      stream.on("finish", () => stream.close(resolve));
+      stream.on("finish", () => stream.close(() => resolve(res.headers)));
       stream.on("error", reject);
     });
 
     req.setTimeout(30000, () => req.destroy(new Error(`Timeout downloading ${rawUrl}`)));
     req.on("error", reject);
   });
+}
+
+/**
+ * Find a sourceMappingURL reference in JS content: the standard
+ * "//# sourceMappingURL=..." (or legacy "//@ sourceMappingURL=...")
+ * comment. If more than one is present, the last one wins, matching
+ * how browsers/tools resolve duplicate directives.
+ */
+function findSourceMappingUrlInContent(jsContent) {
+  const regex = /\/\/[#@]\s*sourceMappingURL=(\S+)/g;
+  let match;
+  let last = null;
+  while ((match = regex.exec(jsContent)) !== null) last = match[1];
+  return last;
+}
+
+/**
+ * Decide where the sourcemap comes from when -map wasn't given:
+ * 1. A sourceMappingURL comment in the JS body (may be a relative/absolute
+ *    URL, or an inline "data:application/json[;base64],..." map).
+ * 2. A SourceMap / X-SourceMap response header on the JS download.
+ * Returns null if nothing was found.
+ */
+function discoverMapReference(jsFile, jsHeaders, jsUrl) {
+  const content = fs.readFileSync(jsFile, "utf8");
+  const headerVal = (jsHeaders && (jsHeaders["sourcemap"] || jsHeaders["x-sourcemap"])) || null;
+  const ref = findSourceMappingUrlInContent(content) || headerVal;
+  if (!ref) return null;
+
+  if (ref.startsWith("data:")) {
+    const commaIdx = ref.indexOf(",");
+    if (commaIdx === -1) return null;
+    const meta = ref.slice(5, commaIdx);
+    const data = ref.slice(commaIdx + 1);
+    const mapJson = meta.includes("base64")
+      ? Buffer.from(data, "base64").toString("utf8")
+      : decodeURIComponent(data);
+    return { kind: "inline", mapJson, ref };
+  }
+
+  const resolvedUrl = new URL(ref, jsUrl).toString();
+  return { kind: "url", url: resolvedUrl, ref };
 }
 
 /**
@@ -105,12 +161,9 @@ function download(rawUrl, outFile, redirectCount = 0) {
 function sanitizeSourcePath(rawSource, sourceRoot) {
   let p = sourceRoot ? `${sourceRoot.replace(/\/+$/, "")}/${rawSource}` : rawSource;
 
-  // Strip common bundler protocol prefixes.
   p = p.replace(/^webpack-internal:\/\/\//, "");
   p = p.replace(/^webpack:\/\/\/?/, "");
   p = p.replace(/^file:\/\/\//, "");
-
-  // Drop query/hash suffixes some bundlers append to source paths.
   p = p.split("?")[0].split("#")[0];
 
   try {
@@ -121,12 +174,10 @@ function sanitizeSourcePath(rawSource, sourceRoot) {
 
   p = p.replace(/\\/g, "/");
 
-  // Split into segments and drop anything that could escape the output dir:
-  // "..", ".", empty segments (from "//"), and absolute-path leading slash.
   const segments = p
     .split("/")
     .filter((seg) => seg !== "" && seg !== "." && seg !== "..")
-    .map((seg) => seg.replace(/[\x00-\x1f]/g, "_")); // strip control chars
+    .map((seg) => seg.replace(/[\x00-\x1f]/g, "_"));
 
   if (segments.length === 0) segments.push("unknown-source.js");
   return segments;
@@ -141,43 +192,53 @@ function safeJoin(root, segments) {
   const resolvedRoot = path.resolve(root);
   const candidate = path.resolve(resolvedRoot, ...segments);
   if (candidate !== resolvedRoot && !candidate.startsWith(resolvedRoot + path.sep)) {
-    // Should be unreachable given sanitizeSourcePath, but fall back to a
-    // flattened filename rather than ever writing outside root.
     const flatName = segments.join("_").replace(/[^a-zA-Z0-9._-]/g, "_") || "unknown-source.js";
     return path.join(resolvedRoot, flatName);
   }
   return candidate;
 }
 
-async function reconstruct(mapFile, { combinedFile, rawDir, writeCombined, writeRaw }) {
-  const raw = fs.readFileSync(mapFile, "utf8");
-  const parsedMap = JSON.parse(raw);
+const EXT_LANGUAGE_MAP = {
+  ".js": "javascript", ".jsx": "javascript", ".mjs": "javascript", ".cjs": "javascript",
+  ".ts": "typescript", ".tsx": "typescript",
+  ".json": "json", ".css": "css", ".scss": "scss", ".less": "less",
+  ".html": "html", ".htm": "html", ".vue": "vue", ".svelte": "svelte",
+  ".map": "sourcemap", ".md": "markdown", ".txt": "text",
+};
+
+function guessLanguage(filePath) {
+  return EXT_LANGUAGE_MAP[path.extname(filePath).toLowerCase()] || "unknown";
+}
+
+async function reconstruct(mapFile, { combinedFile, rawDir, writeCombined, writeRaw, collectJsonl }) {
+  const rawMapText = fs.readFileSync(mapFile, "utf8");
+  const parsedMap = JSON.parse(rawMapText);
   const sourceRoot = parsedMap.sourceRoot || "";
 
   const chunks = [];
   const manifestLines = [];
-  const usedPaths = new Map(); // dedupe collisions between distinct sources
+  const usedPaths = new Map();
+  const sourceRecords = [];
   let writtenCount = 0;
+  let withContentCount = 0;
 
   await SourceMapConsumer.with(parsedMap, null, async (consumer) => {
     for (const source of consumer.sources) {
       const content = consumer.sourceContentFor(source, true);
-      if (content == null) continue;
+      const hasContent = content != null;
+      if (hasContent) withContentCount++;
 
-      if (writeCombined) {
-        chunks.push(`/* ==== source: ${source} ==== */\n${content}\n`);
-      }
+      let rawRelPath = null;
 
-      if (writeRaw) {
+      if (hasContent && writeRaw) {
         const segments = sanitizeSourcePath(source, sourceRoot);
         let outPath = safeJoin(rawDir, segments);
 
-        // Handle two different original sources normalizing to the same path.
         if (usedPaths.has(outPath)) {
           const n = usedPaths.get(outPath) + 1;
           usedPaths.set(outPath, n);
           const ext = path.extname(outPath);
-          outPath = outPath.slice(0, -ext.length || undefined) + `__dup${n}` + ext;
+          outPath = outPath.slice(0, ext ? -ext.length : undefined) + `__dup${n}` + ext;
         } else {
           usedPaths.set(outPath, 0);
         }
@@ -185,7 +246,24 @@ async function reconstruct(mapFile, { combinedFile, rawDir, writeCombined, write
         fs.mkdirSync(path.dirname(outPath), { recursive: true });
         fs.writeFileSync(outPath, content, "utf8");
         manifestLines.push(`${source}\t->\t${path.relative(rawDir, outPath)}`);
+        rawRelPath = path.relative(rawDir, outPath);
         writtenCount++;
+      }
+
+      if (hasContent && writeCombined) {
+        chunks.push(`/* ==== source: ${source} ==== */\n${content}\n`);
+      }
+
+      if (collectJsonl) {
+        sourceRecords.push({
+          record_type: "source",
+          original_source: source,
+          content_available: hasContent,
+          raw_path: rawRelPath ? path.join("raw", rawRelPath) : null,
+          bytes: hasContent ? Buffer.byteLength(content, "utf8") : null,
+          sha256: hasContent ? crypto.createHash("sha256").update(content, "utf8").digest("hex") : null,
+          language: hasContent ? guessLanguage(rawRelPath || source) : null,
+        });
       }
     }
   });
@@ -203,14 +281,23 @@ async function reconstruct(mapFile, { combinedFile, rawDir, writeCombined, write
     fs.writeFileSync(path.join(rawDir, "MANIFEST.txt"), manifestLines.join("\n") + "\n", "utf8");
   }
 
-  return writtenCount;
+  return {
+    writtenCount,
+    totalSources: consumerSourcesLength(parsedMap),
+    withContentCount,
+    sourceRecords,
+  };
 }
 
-function recordUrls(urlsFile, reconstructedName, jsUrl, mapUrl) {
+function consumerSourcesLength(parsedMap) {
+  return Array.isArray(parsedMap.sources) ? parsedMap.sources.length : 0;
+}
+
+function recordUrls(urlsFile, reconstructedName, jsUrl, mapDescriptor) {
   const entry = [
     `/* ==== filename: ${reconstructedName} ==== */`,
     `js: ${jsUrl}`,
-    `map: ${mapUrl}`,
+    `map: ${mapDescriptor}`,
     "",
     "",
   ].join("\n");
@@ -218,30 +305,36 @@ function recordUrls(urlsFile, reconstructedName, jsUrl, mapUrl) {
   fs.appendFileSync(urlsFile, entry, "utf8");
 }
 
+function appendJsonl(jsonlFile, records) {
+  const lines = records.map((r) => JSON.stringify(r)).join("\n") + "\n";
+  fs.appendFileSync(path.resolve(jsonlFile), lines, "utf8");
+}
+
 async function main() {
   if (hasFlag("-h", "--help")) usage(0);
 
   const jsUrl = argValue("-js");
   const mapArg = argValue("-map");
-  if (!jsUrl || !mapArg) usage(1);
+  if (!jsUrl) usage(1);
   if (!isHttpUrl(jsUrl)) {
     console.error("[-] -js must be an http(s) URL");
     process.exit(1);
   }
 
+  INSECURE_TLS = hasFlag("--insecure");
+  if (INSECURE_TLS) console.log("[!] --insecure: TLS certificate verification is disabled");
+
   const outputBase = argValue("-o", "--output") || path.join(process.cwd(), "source-map");
   const writeRaw = !hasFlag("--no-raw");
   const writeCombined = !hasFlag("--no-combined");
+  const jsonlFile = argValue("--jsonl");
 
   const parsedJs = new URL(jsUrl);
   const hostDir = path.join(path.resolve(outputBase), sanitizeHost(parsedJs.host));
   fs.mkdirSync(hostDir, { recursive: true });
 
-  const mapIsUrl = isHttpUrl(mapArg);
   const jsName = fileNameFromUrl(jsUrl, "bundle.js");
-  const mapName = mapIsUrl ? fileNameFromUrl(mapArg, `${jsName}.map`) : path.basename(mapArg);
   const jsFile = path.join(hostDir, jsName);
-  const mapFile = mapIsUrl ? path.join(hostDir, mapName) : path.resolve(mapArg);
   const jsStem = path.basename(jsName, path.extname(jsName));
   const reconstructedFile = path.join(hostDir, `reconstructed-${jsStem}.js`);
   const rawDir = path.join(hostDir, "raw");
@@ -249,34 +342,102 @@ async function main() {
 
   console.log(`[+] Saving files in: ${hostDir}`);
   console.log(`[+] Downloading JS:  ${jsUrl}`);
-  await download(jsUrl, jsFile);
+  const jsHeaders = await download(jsUrl, jsFile);
 
-  if (mapIsUrl) {
-    console.log(`[+] Downloading map: ${mapArg}`);
-    await download(mapArg, mapFile);
+  // Resolve where the map comes from: explicit -map (URL or local file),
+  // or auto-discovery from the JS body / response headers.
+  let mapFile;
+  let mapIsUrl = false;
+  let mapDescriptor;
+  let mapSource; // for jsonl: "provided-url" | "local-file" | "auto-discovered-url" | "auto-discovered-inline"
+
+  if (mapArg) {
+    mapIsUrl = isHttpUrl(mapArg);
+    const mapName = mapIsUrl ? fileNameFromUrl(mapArg, `${jsName}.map`) : path.basename(mapArg);
+    mapFile = mapIsUrl ? path.join(hostDir, mapName) : path.resolve(mapArg);
+    mapSource = mapIsUrl ? "provided-url" : "local-file";
+
+    if (mapIsUrl) {
+      console.log(`[+] Downloading map: ${mapArg}`);
+      await download(mapArg, mapFile);
+      mapDescriptor = mapArg;
+    } else {
+      console.log(`[+] Using local map: ${mapFile}`);
+      if (!fs.existsSync(mapFile)) {
+        console.error(`[-] Local map file not found: ${mapFile}`);
+        process.exit(1);
+      }
+      mapDescriptor = mapFile;
+    }
   } else {
-    console.log(`[+] Using local map: ${mapFile}`);
-    if (!fs.existsSync(mapFile)) {
-      console.error(`[-] Local map file not found: ${mapFile}`);
+    console.log("[+] No -map given, attempting auto-discovery from JS...");
+    const discovered = discoverMapReference(jsFile, jsHeaders, jsUrl);
+    if (!discovered) {
+      console.error("[-] Could not auto-discover a sourceMappingURL comment or SourceMap header. Pass -map explicitly.");
       process.exit(1);
+    }
+
+    if (discovered.kind === "inline") {
+      mapFile = path.join(hostDir, `${jsName}.map`);
+      fs.writeFileSync(mapFile, discovered.mapJson, "utf8");
+      mapDescriptor = "inline (data: URI in JS)";
+      mapSource = "auto-discovered-inline";
+      console.log(`[+] Found inline sourcemap (data: URI), wrote ${mapFile}`);
+    } else {
+      const mapName = fileNameFromUrl(discovered.url, `${jsName}.map`);
+      mapFile = path.join(hostDir, mapName);
+      mapIsUrl = true;
+      mapDescriptor = discovered.url;
+      mapSource = "auto-discovered-url";
+      console.log(`[+] Discovered map reference: ${discovered.ref}`);
+      console.log(`[+] Downloading map: ${discovered.url}`);
+      await download(discovered.url, mapFile);
     }
   }
 
-  console.log(`[+] Reconstructing sources...`);
-  const writtenCount = await reconstruct(mapFile, {
+  console.log("[+] Reconstructing sources...");
+  const result = await reconstruct(mapFile, {
     combinedFile: reconstructedFile,
     rawDir,
     writeCombined,
     writeRaw,
+    collectJsonl: Boolean(jsonlFile),
   });
 
-  recordUrls(urlsFile, path.basename(reconstructedFile), jsUrl, mapIsUrl ? mapArg : mapFile);
+  recordUrls(urlsFile, path.basename(reconstructedFile), jsUrl, mapDescriptor);
+
+  if (jsonlFile) {
+    const timestamp = new Date().toISOString();
+    const runRecord = {
+      record_type: "run",
+      timestamp,
+      host: parsedJs.host,
+      js_url: jsUrl,
+      map_source: mapSource,
+      map_reference: mapDescriptor,
+      output_dir: hostDir,
+      combined_file: writeCombined ? reconstructedFile : null,
+      raw_dir: writeRaw ? rawDir : null,
+      total_sources: result.totalSources,
+      sources_with_content: result.withContentCount,
+      sources_without_content: result.totalSources - result.withContentCount,
+      raw_files_written: result.writtenCount,
+    };
+    const sourceRecordsWithContext = result.sourceRecords.map((r) => ({
+      timestamp,
+      host: parsedJs.host,
+      js_url: jsUrl,
+      ...r,
+    }));
+    appendJsonl(jsonlFile, [runRecord, ...sourceRecordsWithContext]);
+    console.log(`[+] Appended ${1 + sourceRecordsWithContext.length} record(s) to ${path.resolve(jsonlFile)}`);
+  }
 
   console.log("[+] Done");
-  if (mapIsUrl) console.log(`    ${mapFile}`);
   console.log(`    ${jsFile}`);
+  console.log(`    ${mapFile}`);
   if (writeCombined) console.log(`    ${reconstructedFile}`);
-  if (writeRaw) console.log(`    ${rawDir}/ (${writtenCount} files) + MANIFEST.txt`);
+  if (writeRaw) console.log(`    ${rawDir}/ (${result.writtenCount} files) + MANIFEST.txt`);
   console.log(`    ${urlsFile}`);
 }
 
