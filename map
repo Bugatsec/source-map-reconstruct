@@ -1,253 +1,512 @@
 #!/usr/bin/env node
-const fs = require("fs");
+"use strict";
+const fs   = require("fs");
 const path = require("path");
 const http = require("http");
 const https = require("https");
+const zlib = require("zlib");
+const net  = require("net");
+const tls  = require("tls");
 const crypto = require("crypto");
 const { URL } = require("url");
 const { SourceMapConsumer } = require("source-map");
 
-let INSECURE_TLS = false;
+// ─── Constants ────────────────────────────────────────────────────────────────
 
-function usage(exitCode = 0) {
-  console.log(`Usage:
-  map -js <url> [-map <url|local-file>] [options]
+const DEFAULT_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+const DEFAULT_TIMEOUT_MS = 30000;
+const MAX_RETRIES        = 3;
+const RETRY_BASE_MS      = 1000;
+const LOCK_TIMEOUT_MS    = 10000;
 
-Required:
-  -js  <url>            URL of the bundled/minified JS file
+// ─── Argument parsing ─────────────────────────────────────────────────────────
+// All flags are consumed here. Any unrecognised -flag causes an early exit so a
+// typo like -outut never silently falls back to ./source-map and fools the caller
+// with an exit-0 but empty expected directory.
 
-Optional:
-  -map <url|path>       URL of the .js.map file, OR a path to a local .map
-                         file already on disk (skips downloading it).
-                         If omitted, the tool tries to auto-discover the
-                         map from a "//# sourceMappingURL=" comment in the
-                         downloaded JS, or a SourceMap/X-SourceMap response
-                         header, including inline base64 data: maps.
+const KNOWN_VALUE_FLAGS = new Set([
+  "-js", "-map", "-o", "--output", "--jsonl",
+  "--timeout", "--user-agent", "--proxy",
+]);
+const KNOWN_BOOL_FLAGS = new Set([
+  "--insecure", "--no-raw", "--no-combined", "-h", "--help",
+]);
 
-  -o, --output <dir>    Base output directory (default: ./source-map)
-  --insecure            Do not verify TLS certificates (self-signed/lab hosts)
-  --jsonl <file>         Append structured JSON-lines records for this run
-                         to <file> (one "run" record + one "source" record
-                         per entry in the sourcemap's sources[])
-  --no-raw              Don't write the per-source-file raw/ tree
-  --no-combined         Don't write the single combined reconstructed-*.js
-  -h, --help            Show this help
+function parseArgs() {
+  const argv   = process.argv.slice(2);
+  const values = {};
+  const bools  = new Set();
+  const extraHeaders = [];
+  const unknown = [];
 
-Output (under <output>/<host>/):
-  app.js                 the downloaded bundle
-  app.js.map              the downloaded/used/discovered sourcemap
-  reconstructed-app.js    all original sources concatenated into one file
-  raw/...                 each original source written to its own file,
-                          preserving its webpack:// folder structure
-  raw/MANIFEST.txt        maps original source path -> written raw/ file
-  urls.txt                log of js/map URLs used for this run`);
-  process.exit(exitCode);
-}
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
 
-function argValue(...flags) {
-  for (const flag of flags) {
-    const index = process.argv.indexOf(flag);
-    if (index !== -1) return process.argv[index + 1] || null;
+    if (arg === "--header") {
+      const val = argv[++i];
+      if (val === undefined) {
+        console.error(`[-] --header requires a "Name: value" argument`);
+        process.exit(1);
+      }
+      extraHeaders.push(val);
+    } else if (KNOWN_VALUE_FLAGS.has(arg)) {
+      const val = argv[++i];
+      if (val === undefined) {
+        console.error(`[-] ${arg} requires a value`);
+        process.exit(1);
+      }
+      // Catch "-o -js https://..." where the next token is itself a flag.
+      if (KNOWN_VALUE_FLAGS.has(val) || KNOWN_BOOL_FLAGS.has(val) || val === "--header") {
+        console.error(`[-] ${arg} requires a value but the next argument is a flag: "${val}"`);
+        process.exit(1);
+      }
+      values[arg] = val;
+    } else if (KNOWN_BOOL_FLAGS.has(arg)) {
+      bools.add(arg);
+    } else if (arg.startsWith("-")) {
+      unknown.push(arg);
+    }
   }
-  return null;
-}
 
-function hasFlag(...flags) {
-  return flags.some((f) => process.argv.includes(f));
-}
-
-function sanitizeHost(host) {
-  return host.replace(/[^a-zA-Z0-9._-]/g, "_");
-}
-
-function isHttpUrl(value) {
-  try {
-    const u = new URL(value);
-    return u.protocol === "http:" || u.protocol === "https:";
-  } catch {
-    return false;
+  if (unknown.length > 0) {
+    console.error(`[-] Unrecognised flag(s): ${unknown.join(", ")}`);
+    console.error(`    Run with -h / --help for usage.`);
+    process.exit(1);
   }
+
+  return {
+    get:    (...flags)  => { for (const f of flags) if (values[f] !== undefined) return values[f]; return null; },
+    has:    (...flags)  => flags.some(f => bools.has(f)),
+    extraHeaders,
+  };
 }
+
+// ─── Usage ────────────────────────────────────────────────────────────────────
+
+function usage(code = 0) {
+  console.log(`
+Usage:
+  map [-js <url|path>] [-map <url|path>] [options]
+
+Source inputs (at least one required):
+  -js  <url|path>       URL or local path of the bundled JS file.
+                         URL  → downloaded and saved to the output dir.
+                         Path → skips download; used only for naming/logging.
+                         Omit → output dir is derived from -map's URL or path.
+  -map <url|path>       URL or local path of the .js.map file.
+                         Omit → auto-discovered from //# sourceMappingURL=
+                                comment or SourceMap / X-SourceMap HTTP header
+                                (including inline data: URIs).
+
+Options:
+  -o, --output <dir>    Base output directory  (default: ./source-map)
+  --header "N: v"       Extra request header; repeatable. Use for cookies,
+                         auth tokens, etc. Sent on every HTTP request.
+  --proxy <url>         HTTP proxy URL, e.g. http://127.0.0.1:8080.
+                         HTTPS targets are routed via a CONNECT tunnel.
+  --user-agent <ua>     User-Agent string  (default: Chrome 124)
+  --timeout <ms>        Per-request timeout in ms  (default: 30000)
+  --insecure            Disable TLS certificate verification
+  --no-raw              Skip the per-source-file raw/ tree
+  --no-combined         Skip the combined reconstructed-*.js file
+  --jsonl <file>        Append JSON-lines records for this run to <file>
+  -h, --help            Show this message
+
+Output layout — scoped per bundle, not just per host, so two bundles on the
+same host never overwrite each other:
+
+  <output>/<host>/<url-path>/
+    app.js               downloaded bundle  (if -js was a URL)
+    app.js.map            downloaded / discovered sourcemap
+    reconstructed-app.js  all sources concatenated
+    raw/                  each source written as its own file
+    raw/MANIFEST.txt      original path → written file mapping
+    urls.txt              log of URLs / paths used this run
+`.trim());
+  process.exit(code);
+}
+
+// ─── Generic helpers ──────────────────────────────────────────────────────────
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+function isHttpUrl(v) {
+  if (!v) return false;
+  try { const u = new URL(v); return u.protocol === "http:" || u.protocol === "https:"; }
+  catch { return false; }
+}
+
+function sanitizeSegment(s) { return s.replace(/[^a-zA-Z0-9._-]/g, "_"); }
 
 function fileNameFromUrl(rawUrl, fallback) {
-  const parsed = new URL(rawUrl);
-  const base = path.posix.basename(parsed.pathname);
+  const base = path.posix.basename(new URL(rawUrl).pathname);
   return base && base !== "/" ? decodeURIComponent(base) : fallback;
 }
 
-// Resolves with the response headers (lowercase keys) once the file is written.
-function download(rawUrl, outFile, redirectCount = 0) {
-  if (redirectCount > 8) {
-    return Promise.reject(new Error(`Too many redirects for ${rawUrl}`));
+function stripAllExtensions(name) {
+  // "app.js.map" → "app",  "app.min.js" → "app"
+  const dot = name.indexOf(".");
+  return dot === -1 ? name : name.slice(0, dot);
+}
+
+// ─── Output-path scoping  (#1, fully fixed) ─────────────────────────────────
+// Previous version mirrored the URL path directories but still collided on the
+// most common real-world layout: webpack / Next.js code-splitting puts every
+// chunk in the same flat directory:
+//
+//   _next/static/chunks/main.a1b2c3.js
+//   _next/static/chunks/vendor.d4e5f6.js   ← same dir, different bundle
+//
+// Both landed in out/host/_next/static/chunks/, sharing raw/ and MANIFEST.txt.
+// Any overlapping source paths (shared vendor modules show up in multiple chunk
+// maps) silently clobbered each other; MANIFEST.txt was writeFileSync so the
+// second bundle's run stomped the first.
+//
+// Fix: the final path segment is always "<stem>_<8-char-sha256-of-full-url>".
+// Two chunks with different names → different stems.
+// Two chunks that happen to share a name → different hashes.
+// Either way, every bundle always gets its own isolated directory.
+
+function bundleOutputDir(outputBase, ref) {
+  if (!isHttpUrl(ref)) {
+    const abs       = path.resolve(ref);
+    const stem      = stripAllExtensions(path.basename(abs));
+    const shortHash = crypto.createHash("sha256").update(abs).digest("hex").slice(0, 8);
+    return path.join(path.resolve(outputBase), "local", `${sanitizeSegment(stem)}_${shortHash}`);
   }
+  const u           = new URL(ref);
+  const host        = u.host.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const dirSegments = u.pathname
+    .split("/")
+    .slice(0, -1)
+    .filter(Boolean)
+    .map(sanitizeSegment);
+  const stem        = stripAllExtensions(path.posix.basename(u.pathname)) || "bundle";
+  const shortHash   = crypto.createHash("sha256").update(ref).digest("hex").slice(0, 8);
+  return path.join(path.resolve(outputBase), host, ...dirSegments, `${sanitizeSegment(stem)}_${shortHash}`);
+}
 
-  return new Promise((resolve, reject) => {
-    const parsed = new URL(rawUrl);
-    const client = parsed.protocol === "https:" ? https : http;
-    const reqOptions = parsed.protocol === "https:" ? { rejectUnauthorized: !INSECURE_TLS } : {};
+// ─── File locking  (#11) ─────────────────────────────────────────────────────
+// Both appendJsonl() and recordUrls() write shared files that multiple
+// concurrent invocations of the tool (e.g. from assetenum.sh) may target
+// simultaneously. We use a lockfile (atomic O_EXCL create) so appends never
+// interleave. Stale locks from dead PIDs are detected and removed.
 
-    const req = client.get(parsed, reqOptions, (res) => {
-      if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
-        const location = res.headers.location;
-        res.resume();
-        if (!location) return reject(new Error(`Redirect without Location for ${rawUrl}`));
-        return resolve(download(new URL(location, parsed).toString(), outFile, redirectCount + 1));
+async function acquireLock(targetPath) {
+  const lockPath = targetPath + ".lock";
+  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    try {
+      fs.writeFileSync(lockPath, String(process.pid), { flag: "wx" });
+      return lockPath;
+    } catch (e) {
+      if (e.code !== "EEXIST") throw e;
+      // Check whether the holding process is still alive.
+      try {
+        const pid = parseInt(fs.readFileSync(lockPath, "utf8").trim());
+        if (pid > 0) process.kill(pid, 0); // throws ESRCH if gone
+      } catch {
+        try { fs.unlinkSync(lockPath); } catch {}
+        continue; // stale — retry immediately
       }
+      // Live holder: yield the event loop instead of spinning a core.
+      await sleep(30 + Math.random() * 20);
+    }
+  }
+  throw new Error(`Could not acquire lock for ${targetPath} within ${LOCK_TIMEOUT_MS}ms`);
+}
 
-      if (res.statusCode < 200 || res.statusCode >= 300) {
-        res.resume();
-        return reject(new Error(`HTTP ${res.statusCode} while downloading ${rawUrl}`));
-      }
+function releaseLock(lockPath) { try { fs.unlinkSync(lockPath); } catch {} }
 
-      const stream = fs.createWriteStream(outFile);
-      res.pipe(stream);
-      stream.on("finish", () => stream.close(() => resolve(res.headers)));
-      stream.on("error", reject);
+async function appendLocked(targetPath, content) {
+  const lock = await acquireLock(targetPath);
+  try   { fs.appendFileSync(targetPath, content, "utf8"); }
+  finally { releaseLock(lock); }
+}
+
+// ─── HTTP download (#5 #6 #8 #9 #10) ─────────────────────────────────────────
+
+// #4  CONNECT tunnel for HTTPS-through-proxy.
+async function createConnectTunnel(proxyUrl, targetHost, targetPort, insecure) {
+  const proxy = new URL(proxyUrl);
+  const tcpSocket = await new Promise((resolve, reject) => {
+    const s = net.createConnection({
+      host: proxy.hostname,
+      port: parseInt(proxy.port) || 8080,
     });
+    s.once("connect", () => resolve(s));
+    s.once("error", reject);
+  });
 
-    req.setTimeout(30000, () => req.destroy(new Error(`Timeout downloading ${rawUrl}`)));
-    req.on("error", reject);
+  await new Promise((resolve, reject) => {
+    tcpSocket.write(
+      `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\n` +
+      `Host: ${targetHost}:${targetPort}\r\n\r\n`
+    );
+    let buf = Buffer.alloc(0);
+    const onData = (chunk) => {
+      buf = Buffer.concat([buf, chunk]);
+      if (!buf.toString("latin1").includes("\r\n\r\n")) return;
+      tcpSocket.removeListener("data",  onData);
+      tcpSocket.removeListener("error", onErr);
+      const statusLine = buf.toString("latin1").split("\r\n")[0];
+      const code = parseInt((statusLine.match(/\s(\d+)/) || [])[1]);
+      code === 200 ? resolve() : reject(new Error(`Proxy CONNECT failed: ${statusLine}`));
+    };
+    const onErr = reject;
+    tcpSocket.on("data",  onData);
+    tcpSocket.once("error", onErr);
+  });
+
+  return tls.connect({
+    socket: tcpSocket,
+    servername: targetHost,
+    rejectUnauthorized: !insecure,
   });
 }
 
-/**
- * Find a sourceMappingURL reference in JS content: the standard
- * "//# sourceMappingURL=..." (or legacy "//@ sourceMappingURL=...")
- * comment. If more than one is present, the last one wins, matching
- * how browsers/tools resolve duplicate directives.
- */
-function findSourceMappingUrlInContent(jsContent) {
-  const regex = /\/\/[#@]\s*sourceMappingURL=(\S+)/g;
-  let match;
-  let last = null;
-  while ((match = regex.exec(jsContent)) !== null) last = match[1];
+// #9  Decompress based on Content-Encoding.
+function decompressResponse(res) {
+  const enc = (res.headers["content-encoding"] || "").toLowerCase();
+  if (enc === "gzip")    return res.pipe(zlib.createGunzip());
+  if (enc === "deflate") return res.pipe(zlib.createInflate());
+  if (enc === "br")      return res.pipe(zlib.createBrotliDecompress());
+  return res;
+}
+
+// Single attempt; called by the retry wrapper below.
+async function downloadOnce(rawUrl, outFile, opts, redirectCount) {
+  if (redirectCount > 8) throw new Error(`Too many redirects for ${rawUrl}`);
+
+  const parsed  = new URL(rawUrl);
+  const isHttps = parsed.protocol === "https:";
+  const tHost   = parsed.hostname;
+  const tPort   = parseInt(parsed.port) || (isHttps ? 443 : 80);
+
+  // #5  Always send a browser-like User-Agent.
+  const reqHeaders = {
+    "User-Agent":       opts.userAgent,
+    "Accept-Encoding":  "gzip, deflate, br",
+    "Accept":           "*/*",
+    "Connection":       "close",
+    ...opts.extraHeaders,   // #3  --header flags
+  };
+
+  let reqOptions;
+  const client = isHttps ? https : http;
+
+  if (opts.proxy) {
+    // #4  Proxy routing.
+    if (isHttps) {
+      const tunnel = await createConnectTunnel(opts.proxy, tHost, tPort, opts.insecure);
+      reqOptions = {
+        hostname: tHost, port: tPort,
+        path: parsed.pathname + parsed.search,
+        method: "GET",
+        headers: reqHeaders,
+        rejectUnauthorized: !opts.insecure,
+        createConnection: () => tunnel,
+      };
+    } else {
+      const proxy = new URL(opts.proxy);
+      reqOptions = {
+        hostname: proxy.hostname,
+        port: parseInt(proxy.port) || 8080,
+        path: rawUrl,           // full URL as path for HTTP proxies
+        method: "GET",
+        headers: { ...reqHeaders, Host: parsed.host },
+      };
+    }
+  } else {
+    reqOptions = {
+      hostname: tHost, port: tPort,
+      path: parsed.pathname + parsed.search,
+      method: "GET",
+      headers: reqHeaders,
+      rejectUnauthorized: !opts.insecure,
+    };
+  }
+
+  return new Promise((resolve, reject) => {
+    const req = client.request(reqOptions, (res) => {
+      if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
+        const loc = res.headers.location;
+        res.resume();
+        if (!loc) return reject(new Error(`Redirect without Location from ${rawUrl}`));
+        return resolve(downloadOnce(new URL(loc, rawUrl).toString(), outFile, opts, redirectCount + 1));
+      }
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        res.resume();
+        return reject(new Error(`HTTP ${res.statusCode} for ${rawUrl}`));
+      }
+
+      const body   = decompressResponse(res);   // #9
+      const stream = fs.createWriteStream(outFile);
+      body.pipe(stream);
+      stream.on("finish", () => stream.close(() => resolve(res.headers)));
+      stream.on("error", reject);
+      body.on("error",   reject);
+    });
+
+    // #6  Configurable timeout.
+    req.setTimeout(opts.timeout, () =>
+      req.destroy(new Error(`Timeout after ${opts.timeout}ms for ${rawUrl}`))
+    );
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+// #10  Retry wrapper with exponential backoff (transient errors only).
+async function download(rawUrl, outFile, opts, redirectCount = 0) {
+  let lastErr;
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    if (attempt > 0) {
+      const delay = RETRY_BASE_MS * (2 ** (attempt - 1)); // 1 s, 2 s
+      console.log(`[~] Retry ${attempt}/${MAX_RETRIES - 1} (${delay}ms): ${rawUrl}`);
+      await sleep(delay);
+    }
+    try {
+      return await downloadOnce(rawUrl, outFile, opts, redirectCount);
+    } catch (e) {
+      lastErr = e;
+      // Definitive failures — don't retry.
+      if (/^HTTP [45]/.test(e.message) ||
+          /Too many redirects/.test(e.message) ||
+          /Proxy CONNECT failed/.test(e.message)) throw e;
+      console.log(`[~] Transient error (attempt ${attempt + 1}): ${e.message}`);
+    }
+  }
+  throw lastErr;
+}
+
+// ─── Source-map auto-discovery ────────────────────────────────────────────────
+
+function findSourceMappingUrlInContent(js) {
+  const re = /\/\/[#@]\s*sourceMappingURL=(\S+)/g;
+  let m, last = null;
+  while ((m = re.exec(js)) !== null) last = m[1];
   return last;
 }
 
-/**
- * Decide where the sourcemap comes from when -map wasn't given:
- * 1. A sourceMappingURL comment in the JS body (may be a relative/absolute
- *    URL, or an inline "data:application/json[;base64],..." map).
- * 2. A SourceMap / X-SourceMap response header on the JS download.
- * Returns null if nothing was found.
- */
-function discoverMapReference(jsFile, jsHeaders, jsUrl) {
-  const content = fs.readFileSync(jsFile, "utf8");
-  const headerVal = (jsHeaders && (jsHeaders["sourcemap"] || jsHeaders["x-sourcemap"])) || null;
+function discoverMapReference(jsFilePath, jsHeaders, jsBaseUrl) {
+  let content = "";
+  try { content = fs.readFileSync(jsFilePath, "utf8"); } catch {}
+  const headerVal = (jsHeaders || {})["sourcemap"] || (jsHeaders || {})["x-sourcemap"] || null;
   const ref = findSourceMappingUrlInContent(content) || headerVal;
   if (!ref) return null;
 
   if (ref.startsWith("data:")) {
-    const commaIdx = ref.indexOf(",");
-    if (commaIdx === -1) return null;
-    const meta = ref.slice(5, commaIdx);
-    const data = ref.slice(commaIdx + 1);
-    const mapJson = meta.includes("base64")
+    const comma = ref.indexOf(",");
+    if (comma === -1) return null;
+    const meta = ref.slice(5, comma);
+    const data = ref.slice(comma + 1);
+    const json = meta.includes("base64")
       ? Buffer.from(data, "base64").toString("utf8")
       : decodeURIComponent(data);
-    return { kind: "inline", mapJson, ref };
+    return { kind: "inline", mapJson: json, ref };
   }
 
-  const resolvedUrl = new URL(ref, jsUrl).toString();
-  return { kind: "url", url: resolvedUrl, ref };
+  const resolved = new URL(ref, jsBaseUrl).toString();
+  return { kind: "url", url: resolved, ref };
 }
 
-/**
- * Turn a raw "sources" entry (e.g. "webpack://app/./src/auth.js",
- * or something adversarial like "webpack://../../../../etc/passwd")
- * into a list of safe path segments with no traversal, no leading
- * slashes, and no protocol prefixes.
- */
-function sanitizeSourcePath(rawSource, sourceRoot) {
-  let p = sourceRoot ? `${sourceRoot.replace(/\/+$/, "")}/${rawSource}` : rawSource;
+// ─── Path sanitization ────────────────────────────────────────────────────────
 
-  p = p.replace(/^webpack-internal:\/\/\//, "");
-  p = p.replace(/^webpack:\/\/\/?/, "");
-  p = p.replace(/^file:\/\/\//, "");
-  p = p.split("?")[0].split("#")[0];
-
-  try {
-    p = decodeURIComponent(p);
-  } catch {
-    // leave as-is if it isn't validly encoded
-  }
-
-  p = p.replace(/\\/g, "/");
-
-  const segments = p
-    .split("/")
-    .filter((seg) => seg !== "" && seg !== "." && seg !== "..")
-    .map((seg) => seg.replace(/[\x00-\x1f]/g, "_"));
-
-  if (segments.length === 0) segments.push("unknown-source.js");
-  return segments;
-}
-
-/**
- * Join sanitized segments under root and verify the result cannot
- * escape root, even after sanitizeSourcePath's own filtering. Belt
- * and suspenders against path traversal from untrusted map content.
- */
-function safeJoin(root, segments) {
-  const resolvedRoot = path.resolve(root);
-  const candidate = path.resolve(resolvedRoot, ...segments);
-  if (candidate !== resolvedRoot && !candidate.startsWith(resolvedRoot + path.sep)) {
-    const flatName = segments.join("_").replace(/[^a-zA-Z0-9._-]/g, "_") || "unknown-source.js";
-    return path.join(resolvedRoot, flatName);
-  }
-  return candidate;
-}
-
-const EXT_LANGUAGE_MAP = {
+const EXT_LANG = {
   ".js": "javascript", ".jsx": "javascript", ".mjs": "javascript", ".cjs": "javascript",
   ".ts": "typescript", ".tsx": "typescript",
   ".json": "json", ".css": "css", ".scss": "scss", ".less": "less",
   ".html": "html", ".htm": "html", ".vue": "vue", ".svelte": "svelte",
   ".map": "sourcemap", ".md": "markdown", ".txt": "text",
 };
+const guessLang = (p) => EXT_LANG[path.extname(String(p)).toLowerCase()] || "unknown";
 
-function guessLanguage(filePath) {
-  return EXT_LANGUAGE_MAP[path.extname(filePath).toLowerCase()] || "unknown";
+function sanitizeSourcePath(raw, sourceRoot) {
+  let p = sourceRoot ? `${sourceRoot.replace(/\/+$/, "")}/${raw}` : raw;
+  p = p
+    .replace(/^webpack-internal:\/\/\//, "")
+    .replace(/^webpack:\/\/\/?/, "")
+    .replace(/^file:\/\/\//, "");
+  p = p.split("?")[0].split("#")[0];
+  try { p = decodeURIComponent(p); } catch {}
+  p = p.replace(/\\/g, "/");
+  const segs = p
+    .split("/")
+    .filter(s => s !== "" && s !== "." && s !== "..")
+    .map(s => s.replace(/[\x00-\x1f]/g, "_"));
+  return segs.length ? segs : ["unknown-source.js"];
 }
 
+function safeJoin(root, segments) {
+  const r = path.resolve(root);
+  const c = path.resolve(r, ...segments);
+  if (c !== r && !c.startsWith(r + path.sep)) {
+    // Belt-and-suspenders: should be unreachable after sanitizeSourcePath.
+    return path.join(r, segments.join("_").replace(/[^a-zA-Z0-9._-]/g, "_") || "unknown-source.js");
+  }
+  return c;
+}
+
+// ─── Reconstruction ───────────────────────────────────────────────────────────
+
 async function reconstruct(mapFile, { combinedFile, rawDir, writeCombined, writeRaw, collectJsonl }) {
-  const rawMapText = fs.readFileSync(mapFile, "utf8");
-  const parsedMap = JSON.parse(rawMapText);
-  const sourceRoot = parsedMap.sourceRoot || "";
+  const rawText = fs.readFileSync(mapFile, "utf8");
+  let parsed;
+  try {
+    parsed = JSON.parse(rawText);
+  } catch (e) {
+    // #9  Give a clearer error when the file is still gzip-compressed.
+    const b0 = rawText.charCodeAt(0), b1 = rawText.charCodeAt(1);
+    const hint = (b0 === 0x1f && b1 === 0x8b)
+      ? " (file starts with gzip magic bytes — Content-Encoding was not decoded)"
+      : "";
+    throw new Error(`Failed to parse source map JSON${hint}: ${e.message}`);
+  }
 
-  const chunks = [];
-  const manifestLines = [];
+  const sourceRoot = parsed.sourceRoot || "";
+  const chunks = [], manifestLines = [], sourceRecords = [];
   const usedPaths = new Map();
-  const sourceRecords = [];
-  let writtenCount = 0;
-  let withContentCount = 0;
+  let writtenCount = 0, withContent = 0, skipCount = 0;
 
-  await SourceMapConsumer.with(parsedMap, null, async (consumer) => {
+  if (writeRaw) fs.mkdirSync(rawDir, { recursive: true });
+
+  await SourceMapConsumer.with(parsed, null, async (consumer) => {
     for (const source of consumer.sources) {
-      const content = consumer.sourceContentFor(source, true);
+      const content    = consumer.sourceContentFor(source, true);
       const hasContent = content != null;
-      if (hasContent) withContentCount++;
+      if (hasContent) withContent++;
 
       let rawRelPath = null;
 
       if (hasContent && writeRaw) {
-        const segments = sanitizeSourcePath(source, sourceRoot);
-        let outPath = safeJoin(rawDir, segments);
+        // #7  Per-source try/catch: a bad path never aborts the whole map.
+        try {
+          const segs = sanitizeSourcePath(source, sourceRoot);
+          let outPath = safeJoin(rawDir, segs);
 
-        if (usedPaths.has(outPath)) {
-          const n = usedPaths.get(outPath) + 1;
-          usedPaths.set(outPath, n);
-          const ext = path.extname(outPath);
-          outPath = outPath.slice(0, ext ? -ext.length : undefined) + `__dup${n}` + ext;
-        } else {
-          usedPaths.set(outPath, 0);
+          // Deduplicate within this run (usedPaths is per-reconstruct call;
+          // the bundle-scoped rawDir already prevents cross-run collisions).
+          if (usedPaths.has(outPath)) {
+            const n = usedPaths.get(outPath) + 1;
+            usedPaths.set(outPath, n);
+            const ext = path.extname(outPath);
+            outPath = (ext ? outPath.slice(0, -ext.length) : outPath) + `__dup${n}` + ext;
+          } else {
+            usedPaths.set(outPath, 0);
+          }
+
+          fs.mkdirSync(path.dirname(outPath), { recursive: true });
+          fs.writeFileSync(outPath, content, "utf8");
+          rawRelPath = path.relative(rawDir, outPath);
+          manifestLines.push(`${source}\t->\t${rawRelPath}`);
+          writtenCount++;
+        } catch (e) {
+          console.error(`[!] Skipping source "${source}": ${e.message}`);
+          skipCount++;
         }
-
-        fs.mkdirSync(path.dirname(outPath), { recursive: true });
-        fs.writeFileSync(outPath, content, "utf8");
-        manifestLines.push(`${source}\t->\t${path.relative(rawDir, outPath)}`);
-        rawRelPath = path.relative(rawDir, outPath);
-        writtenCount++;
       }
 
       if (hasContent && writeCombined) {
@@ -256,13 +515,13 @@ async function reconstruct(mapFile, { combinedFile, rawDir, writeCombined, write
 
       if (collectJsonl) {
         sourceRecords.push({
-          record_type: "source",
-          original_source: source,
+          record_type:       "source",
+          original_source:   source,
           content_available: hasContent,
-          raw_path: rawRelPath ? path.join("raw", rawRelPath) : null,
-          bytes: hasContent ? Buffer.byteLength(content, "utf8") : null,
-          sha256: hasContent ? crypto.createHash("sha256").update(content, "utf8").digest("hex") : null,
-          language: hasContent ? guessLanguage(rawRelPath || source) : null,
+          raw_path:          rawRelPath ? path.join("raw", rawRelPath) : null,
+          bytes:             hasContent ? Buffer.byteLength(content, "utf8") : null,
+          sha256:            hasContent ? crypto.createHash("sha256").update(content).digest("hex") : null,
+          language:          hasContent ? guessLang(rawRelPath || source) : null,
         });
       }
     }
@@ -270,178 +529,241 @@ async function reconstruct(mapFile, { combinedFile, rawDir, writeCombined, write
 
   if (writeCombined) {
     if (chunks.length === 0) {
-      chunks.push("/* This source map does not contain sourcesContent, so original sources cannot be reconstructed from the map alone. */\n");
-      chunks.push(`/* Sources listed in map:\n${(parsedMap.sources || []).join("\n")}\n*/\n`);
+      chunks.push("/* Source map has no sourcesContent — original sources cannot be reconstructed. */\n");
+      chunks.push(`/* Sources listed:\n${(parsed.sources || []).join("\n")}\n*/\n`);
     }
     fs.writeFileSync(combinedFile, chunks.join("\n"), "utf8");
   }
 
   if (writeRaw) {
-    fs.mkdirSync(rawDir, { recursive: true });
     fs.writeFileSync(path.join(rawDir, "MANIFEST.txt"), manifestLines.join("\n") + "\n", "utf8");
   }
 
   return {
-    writtenCount,
-    totalSources: consumerSourcesLength(parsedMap),
-    withContentCount,
+    writtenCount, skipCount,
+    totalSources: Array.isArray(parsed.sources) ? parsed.sources.length : 0,
+    withContent,
     sourceRecords,
   };
 }
 
-function consumerSourcesLength(parsedMap) {
-  return Array.isArray(parsedMap.sources) ? parsedMap.sources.length : 0;
+// ─── Logging helpers ──────────────────────────────────────────────────────────
+
+async function recordUrls(urlsFile, combinedName, jsDesc, mapDesc) {
+  await appendLocked(urlsFile, [
+    `/* ==== filename: ${combinedName} ==== */`,
+    `js:  ${jsDesc}`,
+    `map: ${mapDesc}`,
+    "", "",
+  ].join("\n"));
 }
 
-function recordUrls(urlsFile, reconstructedName, jsUrl, mapDescriptor) {
-  const entry = [
-    `/* ==== filename: ${reconstructedName} ==== */`,
-    `js: ${jsUrl}`,
-    `map: ${mapDescriptor}`,
-    "",
-    "",
-  ].join("\n");
-
-  fs.appendFileSync(urlsFile, entry, "utf8");
+async function writeJsonl(jsonlFile, records) {
+  await appendLocked(
+    path.resolve(jsonlFile),
+    records.map(r => JSON.stringify(r)).join("\n") + "\n"
+  );
 }
 
-function appendJsonl(jsonlFile, records) {
-  const lines = records.map((r) => JSON.stringify(r)).join("\n") + "\n";
-  fs.appendFileSync(path.resolve(jsonlFile), lines, "utf8");
-}
+// ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
-  if (hasFlag("-h", "--help")) usage(0);
+  const args = parseArgs();
+  if (args.has("-h", "--help")) usage(0);
 
-  const jsUrl = argValue("-js");
-  const mapArg = argValue("-map");
-  if (!jsUrl) usage(1);
-  if (!isHttpUrl(jsUrl)) {
-    console.error("[-] -js must be an http(s) URL");
+  const jsArg  = args.get("-js");
+  const mapArg = args.get("-map");
+
+  if (!jsArg && !mapArg) {
+    console.error("[-] At least one of -js or -map is required.");
+    usage(1);
+  }
+  // -js is now optional even when -map is a URL: the output dir is derived from
+  // whichever reference is available (effectiveRef = jsArg || mapArg).
+
+  const insecure     = args.has("--insecure");
+  const writeRaw     = !args.has("--no-raw");
+  const writeCombined = !args.has("--no-combined");
+  const outputBase   = args.get("-o", "--output") || path.join(process.cwd(), "source-map");
+  const jsonlFile    = args.get("--jsonl");
+  const proxyUrl     = args.get("--proxy");
+  const userAgent    = args.get("--user-agent") || DEFAULT_UA;
+  const timeoutMs    = parseInt(args.get("--timeout") || String(DEFAULT_TIMEOUT_MS));
+
+  if (isNaN(timeoutMs) || timeoutMs <= 0) {
+    console.error("[-] --timeout must be a positive integer (milliseconds)");
     process.exit(1);
   }
 
-  INSECURE_TLS = hasFlag("--insecure");
-  if (INSECURE_TLS) console.log("[!] --insecure: TLS certificate verification is disabled");
+  // Parse --header "Name: value" pairs into an object for reqHeaders spread.
+  const extraHeadersObj = {};
+  for (const h of args.extraHeaders) {
+    const colon = h.indexOf(":");
+    if (colon === -1) {
+      console.error(`[-] --header "${h}" has no colon separator`);
+      process.exit(1);
+    }
+    extraHeadersObj[h.slice(0, colon).trim()] = h.slice(colon + 1).trim();
+  }
 
-  const outputBase = argValue("-o", "--output") || path.join(process.cwd(), "source-map");
-  const writeRaw = !hasFlag("--no-raw");
-  const writeCombined = !hasFlag("--no-combined");
-  const jsonlFile = argValue("--jsonl");
+  const reqOpts = {
+    userAgent,
+    timeout:      timeoutMs,
+    insecure,
+    proxy:        proxyUrl || null,
+    extraHeaders: extraHeadersObj,
+  };
 
-  const parsedJs = new URL(jsUrl);
-  const hostDir = path.join(path.resolve(outputBase), sanitizeHost(parsedJs.host));
-  fs.mkdirSync(hostDir, { recursive: true });
+  if (insecure)  console.log("[!] --insecure: TLS certificate verification is disabled");
+  if (proxyUrl)  console.log(`[+] Proxy: ${proxyUrl}`);
 
-  const jsName = fileNameFromUrl(jsUrl, "bundle.js");
-  const jsFile = path.join(hostDir, jsName);
-  const jsStem = path.basename(jsName, path.extname(jsName));
-  const reconstructedFile = path.join(hostDir, `reconstructed-${jsStem}.js`);
-  const rawDir = path.join(hostDir, "raw");
-  const urlsFile = path.join(hostDir, "urls.txt");
+  // ── Output directory (#1) ──────────────────────────────────────────────────
+  // Scoped by the full URL *path*, not just the host. Two bundles on the same
+  // host (/static/v1/app.js and /static/v2/app.js) always get separate dirs.
+  const effectiveRef = jsArg || mapArg;
+  const bundleDir    = bundleOutputDir(outputBase, effectiveRef);
+  fs.mkdirSync(bundleDir, { recursive: true });
+  console.log(`[+] Output dir: ${bundleDir}`);
 
-  console.log(`[+] Saving files in: ${hostDir}`);
-  console.log(`[+] Downloading JS:  ${jsUrl}`);
-  const jsHeaders = await download(jsUrl, jsFile);
+  // ── JS file (#2) ──────────────────────────────────────────────────────────
+  const jsName = jsArg
+    ? (isHttpUrl(jsArg) ? fileNameFromUrl(jsArg, "bundle.js") : path.basename(jsArg))
+    : stripAllExtensions(path.basename(mapArg)) + ".js";
 
-  // Resolve where the map comes from: explicit -map (URL or local file),
-  // or auto-discovery from the JS body / response headers.
-  let mapFile;
-  let mapIsUrl = false;
-  let mapDescriptor;
-  let mapSource; // for jsonl: "provided-url" | "local-file" | "auto-discovered-url" | "auto-discovered-inline"
+  const jsFile = path.join(bundleDir, jsName);
+  let   jsHeaders = {};
+  let   jsDescriptor;
+
+  if (!jsArg) {
+    jsDescriptor = "(none — reconstruction only)";
+    console.log(`[+] No -js given — skipping bundle download.`);
+  } else if (isHttpUrl(jsArg)) {
+    jsDescriptor = jsArg;
+    console.log(`[+] Downloading JS:  ${jsArg}`);
+    jsHeaders = await download(jsArg, jsFile, reqOpts);
+  } else {
+    jsDescriptor = path.resolve(jsArg);
+    console.log(`[+] Using local JS:  ${jsDescriptor}`);
+    if (!fs.existsSync(jsDescriptor)) {
+      console.error(`[-] Local JS file not found: ${jsDescriptor}`); process.exit(1);
+    }
+  }
+
+  // ── Map file ───────────────────────────────────────────────────────────────
+  let mapFile, mapDescriptor, mapSource;
 
   if (mapArg) {
-    mapIsUrl = isHttpUrl(mapArg);
-    const mapName = mapIsUrl ? fileNameFromUrl(mapArg, `${jsName}.map`) : path.basename(mapArg);
-    mapFile = mapIsUrl ? path.join(hostDir, mapName) : path.resolve(mapArg);
-    mapSource = mapIsUrl ? "provided-url" : "local-file";
-
-    if (mapIsUrl) {
-      console.log(`[+] Downloading map: ${mapArg}`);
-      await download(mapArg, mapFile);
+    if (isHttpUrl(mapArg)) {
+      const mapName = fileNameFromUrl(mapArg, `${jsName}.map`);
+      mapFile       = path.join(bundleDir, mapName);
       mapDescriptor = mapArg;
+      mapSource     = "provided-url";
+      console.log(`[+] Downloading map: ${mapArg}`);
+      await download(mapArg, mapFile, reqOpts);
     } else {
+      mapFile       = path.resolve(mapArg);
+      mapDescriptor = mapFile;
+      mapSource     = "local-file";
       console.log(`[+] Using local map: ${mapFile}`);
       if (!fs.existsSync(mapFile)) {
-        console.error(`[-] Local map file not found: ${mapFile}`);
-        process.exit(1);
+        console.error(`[-] Local map file not found: ${mapFile}`); process.exit(1);
       }
-      mapDescriptor = mapFile;
     }
   } else {
-    console.log("[+] No -map given, attempting auto-discovery from JS...");
-    const discovered = discoverMapReference(jsFile, jsHeaders, jsUrl);
-    if (!discovered) {
-      console.error("[-] Could not auto-discover a sourceMappingURL comment or SourceMap header. Pass -map explicitly.");
+    // Auto-discovery: read from wherever the JS content actually lives.
+    const jsContentPath = jsArg && !isHttpUrl(jsArg)
+      ? path.resolve(jsArg)
+      : jsFile;                    // the downloaded copy
+    const jsBaseUrl = isHttpUrl(jsArg)
+      ? jsArg
+      : `file://${path.resolve(jsArg || jsFile)}`;
+
+    console.log("[+] No -map given — auto-discovering sourcemap reference...");
+    const found = discoverMapReference(jsContentPath, jsHeaders, jsBaseUrl);
+
+    if (!found) {
+      console.error("[-] No //# sourceMappingURL= comment or SourceMap header found.");
+      console.error("    Pass -map explicitly.");
       process.exit(1);
     }
 
-    if (discovered.kind === "inline") {
-      mapFile = path.join(hostDir, `${jsName}.map`);
-      fs.writeFileSync(mapFile, discovered.mapJson, "utf8");
-      mapDescriptor = "inline (data: URI in JS)";
-      mapSource = "auto-discovered-inline";
-      console.log(`[+] Found inline sourcemap (data: URI), wrote ${mapFile}`);
+    if (found.kind === "inline") {
+      mapFile       = path.join(bundleDir, `${jsName}.map`);
+      mapDescriptor = "inline data: URI in JS bundle";
+      mapSource     = "auto-discovered-inline";
+      fs.writeFileSync(mapFile, found.mapJson, "utf8");
+      console.log(`[+] Found inline sourcemap — wrote ${mapFile}`);
+    } else if (found.url.startsWith("file://")) {
+      // Relative reference from a local JS file.
+      mapFile       = new URL(found.url).pathname;
+      mapDescriptor = mapFile;
+      mapSource     = "auto-discovered-local";
+      console.log(`[+] Discovered local map: ${mapFile}`);
+      if (!fs.existsSync(mapFile)) {
+        console.error(`[-] Discovered map file not found: ${mapFile}`); process.exit(1);
+      }
     } else {
-      const mapName = fileNameFromUrl(discovered.url, `${jsName}.map`);
-      mapFile = path.join(hostDir, mapName);
-      mapIsUrl = true;
-      mapDescriptor = discovered.url;
-      mapSource = "auto-discovered-url";
-      console.log(`[+] Discovered map reference: ${discovered.ref}`);
-      console.log(`[+] Downloading map: ${discovered.url}`);
-      await download(discovered.url, mapFile);
+      const mapName = fileNameFromUrl(found.url, `${jsName}.map`);
+      mapFile       = path.join(bundleDir, mapName);
+      mapDescriptor = found.url;
+      mapSource     = "auto-discovered-url";
+      console.log(`[+] Discovered: ${found.ref}`);
+      console.log(`[+] Downloading map: ${found.url}`);
+      await download(found.url, mapFile, reqOpts);
     }
   }
 
+  // ── Reconstruct ────────────────────────────────────────────────────────────
+  const jsStem       = path.basename(jsName, path.extname(jsName));
+  const combinedFile = path.join(bundleDir, `reconstructed-${jsStem}.js`);
+  const rawDir       = path.join(bundleDir, "raw");
+  const urlsFile     = path.join(bundleDir, "urls.txt");
+
   console.log("[+] Reconstructing sources...");
   const result = await reconstruct(mapFile, {
-    combinedFile: reconstructedFile,
-    rawDir,
-    writeCombined,
-    writeRaw,
+    combinedFile, rawDir, writeCombined, writeRaw,
     collectJsonl: Boolean(jsonlFile),
   });
 
-  recordUrls(urlsFile, path.basename(reconstructedFile), jsUrl, mapDescriptor);
+  if (result.skipCount > 0) {
+    console.log(`[!] ${result.skipCount} source(s) skipped due to write errors (see above)`);
+  }
+
+  await recordUrls(urlsFile, path.basename(combinedFile), jsDescriptor, mapDescriptor);
 
   if (jsonlFile) {
-    const timestamp = new Date().toISOString();
+    const ts   = new Date().toISOString();
+    const host = isHttpUrl(effectiveRef) ? new URL(effectiveRef).host : "local";
     const runRecord = {
-      record_type: "run",
-      timestamp,
-      host: parsedJs.host,
-      js_url: jsUrl,
-      map_source: mapSource,
-      map_reference: mapDescriptor,
-      output_dir: hostDir,
-      combined_file: writeCombined ? reconstructedFile : null,
-      raw_dir: writeRaw ? rawDir : null,
-      total_sources: result.totalSources,
-      sources_with_content: result.withContentCount,
-      sources_without_content: result.totalSources - result.withContentCount,
-      raw_files_written: result.writtenCount,
+      record_type:              "run",
+      timestamp:                ts,
+      host,
+      js_url:                   jsDescriptor,
+      map_source:               mapSource,
+      map_reference:            mapDescriptor,
+      output_dir:               bundleDir,
+      combined_file:            writeCombined ? combinedFile : null,
+      raw_dir:                  writeRaw      ? rawDir       : null,
+      total_sources:            result.totalSources,
+      sources_with_content:     result.withContent,
+      sources_without_content:  result.totalSources - result.withContent,
+      raw_files_written:        result.writtenCount,
+      raw_files_skipped:        result.skipCount,
     };
-    const sourceRecordsWithContext = result.sourceRecords.map((r) => ({
-      timestamp,
-      host: parsedJs.host,
-      js_url: jsUrl,
-      ...r,
-    }));
-    appendJsonl(jsonlFile, [runRecord, ...sourceRecordsWithContext]);
-    console.log(`[+] Appended ${1 + sourceRecordsWithContext.length} record(s) to ${path.resolve(jsonlFile)}`);
+    const srcRecords = result.sourceRecords.map(r => ({ timestamp: ts, host, js_url: jsDescriptor, ...r }));
+    await writeJsonl(jsonlFile, [runRecord, ...srcRecords]);
+    console.log(`[+] Appended ${1 + srcRecords.length} record(s) to ${path.resolve(jsonlFile)}`);
   }
 
   console.log("[+] Done");
-  console.log(`    ${jsFile}`);
+  if (jsArg && isHttpUrl(jsArg)) console.log(`    ${jsFile}`);
   console.log(`    ${mapFile}`);
-  if (writeCombined) console.log(`    ${reconstructedFile}`);
-  if (writeRaw) console.log(`    ${rawDir}/ (${result.writtenCount} files) + MANIFEST.txt`);
+  if (writeCombined) console.log(`    ${combinedFile}`);
+  if (writeRaw) {
+    console.log(`    ${rawDir}/ (${result.writtenCount} file(s))`);
+    console.log(`    ${path.join(rawDir, "MANIFEST.txt")}`);
+  }
   console.log(`    ${urlsFile}`);
 }
 
-main().catch((err) => {
-  console.error(`[-] ${err.message}`);
-  process.exit(1);
-});
+main().catch(err => { console.error(`[-] ${err.message}`); process.exit(1); });
