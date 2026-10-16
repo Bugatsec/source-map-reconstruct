@@ -14,7 +14,7 @@ You give it the JavaScript URL and the source map URL. It downloads both files, 
 ## Features
 
 - Downloads a JavaScript bundle from `-js <url>`, or uses a local file path.
-- Downloads its source map from `-map <url>`, uses a local file path, or **auto-discovers** it from a `//# sourceMappingURL=` comment or `SourceMap` response header in the JS: including inline `data:` maps that need no second request.
+- Downloads its source map from `-map <url>`, uses a local file path, or **auto-discovers** it from a `//# sourceMappingURL=` comment or `SourceMap` response header in the JS — including inline `data:` maps that need no second request.
 - Creates a folder scoped per bundle under the target host, for example `example.com/_next/static/chunks/main_a1b2c3d4/`.
 - Saves the original `.js` and `.map` files.
 - Reconstructs readable source content into `reconstructed-<name>.js` (all sources concatenated).
@@ -133,7 +133,7 @@ source-map/
                     └── client.js
 ```
 
-The trailing `_3f9a1b2c` is a short hash of the full JS URL. It ensures that two bundles in the same directory: for example `_next/static/chunks/main.a1b2c3.js` and `_next/static/chunks/vendor.d4e5f6.js` — always get their own isolated folder and never overwrite each other's `raw/` files or `MANIFEST.txt`.
+The trailing `_3f9a1b2c` is a short hash of the full JS URL. It ensures that two bundles in the same directory — for example `_next/static/chunks/main.a1b2c3.js` and `_next/static/chunks/vendor.d4e5f6.js` — always get their own isolated folder and never overwrite each other's `raw/` files or `MANIFEST.txt`.
 
 The `urls.txt` file looks like this:
 
